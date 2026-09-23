@@ -2078,9 +2078,17 @@ function exportHistory() {
 
 // ====== Alerts ======
 async function loadAlerts() {
-  const data = await api('/api/alerts');
+  // Fetch the full retained alert window; filtering on the default 200-row
+  // snapshot silently drops alerts of other severities and makes the count
+  // shift every time the auto-refresh brings in new data.
+  const data = await api('/api/alerts?limit=1000');
   if (!data) return;
-  state.alerts = data.alerts || [];
+  const seen = new Set();
+  state.alerts = (data.alerts || []).filter(a => {
+    if (seen.has(a.id)) return false;
+    seen.add(a.id);
+    return true;
+  });
   renderAlerts();
   updateAlertBadge();
 }

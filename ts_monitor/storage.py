@@ -9,6 +9,7 @@ Time-Series Storage Engine
 import json
 import os
 import time
+import uuid
 import threading
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
@@ -41,6 +42,28 @@ class TimeSeriesStorage:
         self.metadata = self._load_json(self.meta_file, {"sources": {}, "stats": {}})
         self.rules = self._load_json(self.rules_file, {"rules": []})
         self.alerts = self._load_json(self.alerts_file, {"alerts": [], "suppressed": {}})
+
+        # Guards for structures shared by ingestion/simulation/HTTP threads.
+        # RLock so handlers can compose multiple locked operations safely.
+        self._alerts_lock = threading.RLock()
+        self._rules_lock = threading.RLock()
+        self._meta_lock = threading.RLock()
+
+        self._migrate_duplicate_alert_ids()
+
+    def _migrate_duplicate_alert_ids(self):
+        """Assign fresh unique ids to alerts created before ids were unique."""
+        alerts = self.alerts.get("alerts", [])
+        seen = set()
+        changed = False
+        for alert in alerts:
+            aid = alert.get("id")
+            if not aid or aid in seen:
+                alert["id"] = self._new_alert_id()
+                changed = True
+            seen.add(alert["id"])
+        if changed:
+            self._save_json(self.alerts_file, self.alerts)
 
     def _load_json(self, path: str, default: Any) -> Any:
         """Load JSON file with fallback to default."""
@@ -262,128 +285,157 @@ class TimeSeriesStorage:
 
     def get_sources(self) -> Dict:
         """Get all configured data sources."""
-        return self.metadata.get("sources", {})
+        with self._meta_lock:
+            return dict(self.metadata.get("sources", {}))
 
     def add_source(self, source_id: str, config: Dict) -> Dict:
         """Add or update a data source."""
-        self.metadata["sources"][source_id] = {
-            **config,
-            "id": source_id,
-            "updated_at": datetime.now(timezone.utc).isoformat()
-        }
-        self._save_json(self.meta_file, self.metadata)
-        return self.metadata["sources"][source_id]
+        with self._meta_lock:
+            self.metadata["sources"][source_id] = {
+                **config,
+                "id": source_id,
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }
+            self._save_json(self.meta_file, self.metadata)
+            return dict(self.metadata["sources"][source_id])
 
     def delete_source(self, source_id: str) -> bool:
         """Delete a data source."""
-        if source_id in self.metadata.get("sources", {}):
-            del self.metadata["sources"][source_id]
-            self._save_json(self.meta_file, self.metadata)
-            return True
-        return False
+        with self._meta_lock:
+            if source_id in self.metadata.get("sources", {}):
+                del self.metadata["sources"][source_id]
+                self._save_json(self.meta_file, self.metadata)
+                return True
+            return False
 
     # ---- Rules ----
 
     def get_rules(self) -> List[Dict]:
         """Get all anomaly detection rules."""
-        return self.rules.get("rules", [])
+        with self._rules_lock:
+            return [dict(r) for r in self.rules.get("rules", [])]
 
     def add_rule(self, rule: Dict) -> Dict:
         """Add or update an anomaly detection rule."""
-        rule_id = rule.get("id", f"rule_{int(time.time()*1000)}")
-        rule["id"] = rule_id
-        rule["updated_at"] = datetime.now(timezone.utc).isoformat()
+        with self._rules_lock:
+            rule_id = rule.get("id", f"rule_{int(time.time()*1000)}")
+            rule["id"] = rule_id
+            rule["updated_at"] = datetime.now(timezone.utc).isoformat()
 
-        # Update existing or add new
-        existing = [r for r in self.rules["rules"] if r["id"] != rule_id]
-        existing.append(rule)
-        self.rules["rules"] = existing
+            # Update existing or add new
+            existing = [r for r in self.rules["rules"] if r["id"] != rule_id]
+            existing.append(rule)
+            self.rules["rules"] = existing
 
-        self._save_json(self.rules_file, self.rules)
-        return rule
+            self._save_json(self.rules_file, self.rules)
+            return dict(rule)
 
     def delete_rule(self, rule_id: str) -> bool:
         """Delete an anomaly detection rule."""
-        before = len(self.rules["rules"])
-        self.rules["rules"] = [r for r in self.rules["rules"] if r["id"] != rule_id]
-        if len(self.rules["rules"]) < before:
-            self._save_json(self.rules_file, self.rules)
-            return True
-        return False
+        with self._rules_lock:
+            before = len(self.rules["rules"])
+            self.rules["rules"] = [r for r in self.rules["rules"] if r["id"] != rule_id]
+            if len(self.rules["rules"]) < before:
+                self._save_json(self.rules_file, self.rules)
+                return True
+            return False
 
     # ---- Alerts ----
 
     def get_alerts(self, status: Optional[str] = None,
                    severity: Optional[str] = None,
                    limit: int = 200) -> List[Dict]:
-        """Get alerts with optional filtering."""
-        alerts = self.alerts.get("alerts", [])
+        """Get alerts with optional filtering.
+
+        Filters are applied before the limit, and the result is built under a
+        lock from a consistent snapshot, so identical parameters always return
+        an identical result for the same underlying data.
+        """
+        with self._alerts_lock:
+            alerts = list(self.alerts.get("alerts", []))
+
         if status:
             alerts = [a for a in alerts if a.get("status") == status]
         if severity:
             alerts = [a for a in alerts if a.get("severity") == severity]
-        return sorted(alerts, key=lambda x: x.get("timestamp", 0), reverse=True)[:limit]
+        # timestamp desc, with unique id as a stable tiebreaker
+        alerts.sort(key=lambda x: (x.get("timestamp", 0), x.get("id", "")),
+                    reverse=True)
+
+        if limit is not None and limit > 0:
+            alerts = alerts[:limit]
+        # Return copies so callers can never mutate stored alerts from another
+        # thread (e.g. via the JSON response path).
+        return [dict(a) for a in alerts]
+
+    @staticmethod
+    def _new_alert_id() -> str:
+        """Generate a collision-proof alert id (timestamp + uuid suffix)."""
+        return f"alert_{int(time.time() * 1000)}_{uuid.uuid4().hex[:12]}"
 
     def add_alert(self, alert: Dict) -> Dict:
         """Add a new alert with deduplication."""
-        alert_id = alert.get("id", f"alert_{int(time.time()*1000)}")
-        alert["id"] = alert_id
-        alert["timestamp"] = alert.get("timestamp", time.time())
-        alert["status"] = alert.get("status", "active")
+        with self._alerts_lock:
+            alert = dict(alert)
+            alert["id"] = alert.get("id") or self._new_alert_id()
+            alert["timestamp"] = alert.get("timestamp", time.time())
+            alert["status"] = alert.get("status", "active")
 
-        # Check for duplicate/suppressed alerts
-        suppressed = self.alerts.get("suppressed", {})
-        metric = alert.get("metric", "")
-        rule_id = alert.get("rule_id", "")
-        suppress_key = f"{metric}:{rule_id}"
+            # Check for duplicate/suppressed alerts
+            suppressed = self.alerts.get("suppressed", {})
+            metric = alert.get("metric", "")
+            rule_id = alert.get("rule_id", "")
+            suppress_key = f"{metric}:{rule_id}"
 
-        # Suppress if same metric+rule had an alert in the last 5 minutes
-        if suppress_key in suppressed:
-            last_alert_time = suppressed[suppress_key]
-            if time.time() - last_alert_time < 300:  # 5 min suppression
-                alert["status"] = "suppressed"
-                return alert
+            # Suppress if same metric+rule had an alert in the last 5 minutes
+            if suppress_key in suppressed:
+                last_alert_time = suppressed[suppress_key]
+                if time.time() - last_alert_time < 300:  # 5 min suppression
+                    alert["status"] = "suppressed"
+                    return dict(alert)
 
-        suppressed[suppress_key] = time.time()
-        self.alerts["suppressed"] = suppressed
+            suppressed[suppress_key] = time.time()
+            self.alerts["suppressed"] = suppressed
 
-        self.alerts["alerts"].append(alert)
-        # Keep only last 1000 alerts
-        if len(self.alerts["alerts"]) > 1000:
-            self.alerts["alerts"] = self.alerts["alerts"][-1000:]
+            self.alerts["alerts"].append(alert)
+            # Keep only last 1000 alerts
+            if len(self.alerts["alerts"]) > 1000:
+                self.alerts["alerts"] = self.alerts["alerts"][-1000:]
 
-        self._save_json(self.alerts_file, self.alerts)
-        return alert
+            self._save_json(self.alerts_file, self.alerts)
+            return dict(alert)
 
     def acknowledge_alert(self, alert_id: str) -> bool:
         """Acknowledge an alert."""
-        for alert in self.alerts.get("alerts", []):
-            if alert.get("id") == alert_id:
-                alert["status"] = "acknowledged"
-                alert["acknowledged_at"] = time.time()
-                self._save_json(self.alerts_file, self.alerts)
-                return True
-        return False
+        return self._set_alert_status(alert_id, "acknowledged",
+                                      {"acknowledged_at": time.time()})
 
     def resolve_alert(self, alert_id: str) -> bool:
         """Resolve an alert."""
-        for alert in self.alerts.get("alerts", []):
-            if alert.get("id") == alert_id:
-                alert["status"] = "resolved"
-                alert["resolved_at"] = time.time()
-                self._save_json(self.alerts_file, self.alerts)
-                return True
+        return self._set_alert_status(alert_id, "resolved",
+                                      {"resolved_at": time.time()})
+
+    def _set_alert_status(self, alert_id: str, status: str, extra: Dict) -> bool:
+        """Set the status of the single alert matching alert_id."""
+        with self._alerts_lock:
+            for alert in self.alerts.get("alerts", []):
+                if alert.get("id") == alert_id:
+                    alert["status"] = status
+                    alert.update(extra)
+                    self._save_json(self.alerts_file, self.alerts)
+                    return True
         return False
 
     def cleanup_suppressed(self):
         """Clean up old suppression entries."""
-        suppressed = self.alerts.get("suppressed", {})
-        now = time.time()
-        self.alerts["suppressed"] = {
-            k: v for k, v in suppressed.items()
-            if now - v < 600  # Keep 10 minutes of suppression history
-        }
-        self._save_json(self.alerts_file, self.alerts)
+        with self._alerts_lock:
+            suppressed = self.alerts.get("suppressed", {})
+            now = time.time()
+            self.alerts["suppressed"] = {
+                k: v for k, v in suppressed.items()
+                if now - v < 600  # Keep 10 minutes of suppression history
+            }
+            self._save_json(self.alerts_file, self.alerts)
 
     def get_stats(self) -> Dict:
         """Get storage statistics."""
@@ -403,6 +455,6 @@ class TimeSeriesStorage:
             "metric_count": len(self.get_metrics()),
             "source_count": len(self.get_sources()),
             "rule_count": len(self.get_rules()),
-            "alert_count": len(self.alerts.get("alerts", [])),
+            "alert_count": len(self.get_alerts(limit=None)),
             "cache_size": sum(len(v) for v in self._cache.values())
         }
