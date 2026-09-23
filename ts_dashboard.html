@@ -1332,8 +1332,8 @@ textarea.form-input {
           <div class="section-title">🔔 异常告警列表</div>
           <div style="display:flex;gap:8px;flex-wrap:wrap">
             <select class="form-select" id="alertStatusFilter" style="width:auto" onchange="filterAlerts()">
-              <option value="">全部状态</option>
-              <option value="active">活跃</option>
+              <option value="">全部状态（含已确认/已解决）</option>
+              <option value="active" selected>活跃</option>
               <option value="acknowledged">已确认</option>
               <option value="resolved">已解决</option>
               <option value="suppressed">已抑制</option>
@@ -1522,6 +1522,7 @@ let state = {
   metrics: [],
   dashboardData: null,
   alerts: [],
+  alertStatusCounts: { active: 0, acknowledged: 0, resolved: 0, suppressed: 0 },
   rules: [],
   sources: {},
   selectedDashMetrics: new Set(['cpu.usage', 'memory.usage']),
@@ -1533,6 +1534,7 @@ let lineChart = null;
 let heatmapChart = null;
 let historyChartInstance = null;
 let refreshTimer = null;
+let alertsRequestId = 0;
 
 // ====== Init ======
 document.addEventListener('DOMContentLoaded', () => {
@@ -2078,33 +2080,37 @@ function exportHistory() {
 
 // ====== Alerts ======
 async function loadAlerts() {
-  const data = await api('/api/alerts');
-  if (!data) return;
+  const requestId = ++alertsRequestId;
+  const status = document.getElementById('alertStatusFilter').value;
+  const severity = document.getElementById('alertSeverityFilter').value;
+  const params = new URLSearchParams({ limit: '1000' });
+  if (status) params.set('status', status);
+  if (severity) params.set('severity', severity);
+
+  const data = await api(`/api/alerts?${params.toString()}`);
+  if (!data || requestId !== alertsRequestId) return;
+
   state.alerts = data.alerts || [];
+  state.alertStatusCounts = data.status_counts || {
+    active: 0, acknowledged: 0, resolved: 0, suppressed: 0
+  };
   renderAlerts();
   updateAlertBadge();
 }
 
-function filterAlerts() {
-  renderAlerts();
+async function filterAlerts() {
+  await loadAlerts();
 }
 
 function renderAlerts() {
-  const statusFilter = document.getElementById('alertStatusFilter').value;
-  const severityFilter = document.getElementById('alertSeverityFilter').value;
+  // Update counts from the unfiltered, server-side snapshot
+  const counts = state.alertStatusCounts;
+  document.getElementById('activeAlerts').textContent = counts.active || 0;
+  document.getElementById('ackAlerts').textContent = counts.acknowledged || 0;
+  document.getElementById('resolvedAlerts').textContent = counts.resolved || 0;
+  document.getElementById('suppressedAlerts').textContent = counts.suppressed || 0;
 
-  let filtered = [...state.alerts];
-  if (statusFilter) filtered = filtered.filter(a => a.status === statusFilter);
-  if (severityFilter) filtered = filtered.filter(a => a.severity === severityFilter);
-
-  // Update counts
-  const counts = { active: 0, acknowledged: 0, resolved: 0, suppressed: 0 };
-  state.alerts.forEach(a => { if (counts[a.status] !== undefined) counts[a.status]++; });
-  document.getElementById('activeAlerts').textContent = counts.active;
-  document.getElementById('ackAlerts').textContent = counts.acknowledged;
-  document.getElementById('resolvedAlerts').textContent = counts.resolved;
-  document.getElementById('suppressedAlerts').textContent = counts.suppressed;
-
+  const filtered = state.alerts;
   const container = document.getElementById('alertsList');
   if (!filtered.length) {
     container.innerHTML = '<div class="empty-state"><div class="empty-icon">✅</div><div class="empty-text">暂无告警</div></div>';
@@ -2154,7 +2160,7 @@ async function resolveAlert(id) {
 }
 
 function updateAlertBadge() {
-  const active = state.alerts.filter(a => a.status === 'active').length;
+  const active = state.alertStatusCounts.active || 0;
   document.getElementById('alertBadge').textContent = active;
   document.getElementById('alertBadge').style.display = active > 0 ? '' : 'none';
 }
@@ -2315,7 +2321,7 @@ function updateHeaderStats() {
   const stats = state.dashboardData?.stats || {};
   document.getElementById('totalPoints').textContent = (stats.cache_size || 0).toLocaleString();
   document.getElementById('metricCount').textContent = stats.metric_count || 0;
-  document.getElementById('alertCount').textContent = state.alerts.filter(a => a.status === 'active').length;
+  document.getElementById('alertCount').textContent = state.alertStatusCounts.active || 0;
 }
 
 // ====== Modal Helpers ======

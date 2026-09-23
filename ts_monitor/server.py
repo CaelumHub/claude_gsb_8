@@ -342,7 +342,8 @@ class TimeSeriesHandler(BaseHTTPRequestHandler):
         limit = int(query.get("limit", [200])[0])
 
         alerts = self.storage.get_alerts(status=status, severity=severity, limit=limit)
-        self._send_json({"alerts": alerts, "count": len(alerts)})
+        counts = self.storage.get_alert_counts()
+        self._send_json({"alerts": alerts, "count": len(alerts), "status_counts": counts})
 
     def _handle_acknowledge_alert(self):
         """Acknowledge an alert."""

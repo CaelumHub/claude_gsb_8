@@ -9,6 +9,7 @@ Time-Series Storage Engine
 import json
 import os
 import time
+import uuid
 import threading
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
@@ -41,6 +42,7 @@ class TimeSeriesStorage:
         self.metadata = self._load_json(self.meta_file, {"sources": {}, "stats": {}})
         self.rules = self._load_json(self.rules_file, {"rules": []})
         self.alerts = self._load_json(self.alerts_file, {"alerts": [], "suppressed": {}})
+        self._alerts_lock = threading.Lock()
 
     def _load_json(self, path: str, default: Any) -> Any:
         """Load JSON file with fallback to default."""
@@ -317,73 +319,96 @@ class TimeSeriesStorage:
                    severity: Optional[str] = None,
                    limit: int = 200) -> List[Dict]:
         """Get alerts with optional filtering."""
-        alerts = self.alerts.get("alerts", [])
+        with self._alerts_lock:
+            alerts = [dict(a) for a in self.alerts.get("alerts", [])]
+
         if status:
             alerts = [a for a in alerts if a.get("status") == status]
         if severity:
             alerts = [a for a in alerts if a.get("severity") == severity]
-        return sorted(alerts, key=lambda x: x.get("timestamp", 0), reverse=True)[:limit]
+
+        alerts.sort(key=lambda x: (x.get("timestamp", 0), x.get("id", "")), reverse=True)
+        if limit is not None and limit > 0:
+            alerts = alerts[:limit]
+        return alerts
+
+    def get_alert_counts(self) -> Dict[str, int]:
+        """Get alert counts grouped by current status."""
+        counts = {"active": 0, "acknowledged": 0, "resolved": 0, "suppressed": 0}
+        with self._alerts_lock:
+            alerts = self.alerts.get("alerts", [])
+            for alert in alerts:
+                status = alert.get("status", "active")
+                counts[status] = counts.get(status, 0) + 1
+            counts["total"] = len(alerts)
+        return counts
 
     def add_alert(self, alert: Dict) -> Dict:
         """Add a new alert with deduplication."""
-        alert_id = alert.get("id", f"alert_{int(time.time()*1000)}")
+        now = time.time()
+        alert = dict(alert)
+        alert_id = alert.get("id") or f"alert_{int(now * 1000)}_{uuid.uuid4().hex[:12]}"
         alert["id"] = alert_id
-        alert["timestamp"] = alert.get("timestamp", time.time())
+        alert["timestamp"] = alert.get("timestamp", now)
         alert["status"] = alert.get("status", "active")
 
-        # Check for duplicate/suppressed alerts
-        suppressed = self.alerts.get("suppressed", {})
         metric = alert.get("metric", "")
         rule_id = alert.get("rule_id", "")
         suppress_key = f"{metric}:{rule_id}"
 
-        # Suppress if same metric+rule had an alert in the last 5 minutes
-        if suppress_key in suppressed:
-            last_alert_time = suppressed[suppress_key]
-            if time.time() - last_alert_time < 300:  # 5 min suppression
-                alert["status"] = "suppressed"
-                return alert
+        with self._alerts_lock:
+            # Suppress if same metric+rule had an alert in the last 5 minutes
+            suppressed = self.alerts.get("suppressed", {})
+            if suppress_key in suppressed:
+                last_alert_time = suppressed[suppress_key]
+                if now - last_alert_time < 300:
+                    alert["status"] = "suppressed"
+                    return dict(alert)
 
-        suppressed[suppress_key] = time.time()
-        self.alerts["suppressed"] = suppressed
+            suppressed[suppress_key] = now
+            self.alerts["suppressed"] = suppressed
+            self.alerts["alerts"].append(alert)
 
-        self.alerts["alerts"].append(alert)
-        # Keep only last 1000 alerts
-        if len(self.alerts["alerts"]) > 1000:
-            self.alerts["alerts"] = self.alerts["alerts"][-1000:]
+            # Keep only last 1000 alerts
+            if len(self.alerts["alerts"]) > 1000:
+                self.alerts["alerts"] = self.alerts["alerts"][-1000:]
 
-        self._save_json(self.alerts_file, self.alerts)
-        return alert
+            self._save_json(self.alerts_file, self.alerts)
+
+        return dict(alert)
 
     def acknowledge_alert(self, alert_id: str) -> bool:
         """Acknowledge an alert."""
-        for alert in self.alerts.get("alerts", []):
-            if alert.get("id") == alert_id:
-                alert["status"] = "acknowledged"
-                alert["acknowledged_at"] = time.time()
-                self._save_json(self.alerts_file, self.alerts)
-                return True
+        with self._alerts_lock:
+            for alert in self.alerts.get("alerts", []):
+                if alert.get("id") == alert_id:
+                    alert["status"] = "acknowledged"
+                    alert["acknowledged_at"] = time.time()
+                    self._save_json(self.alerts_file, self.alerts)
+                    return True
         return False
 
     def resolve_alert(self, alert_id: str) -> bool:
         """Resolve an alert."""
-        for alert in self.alerts.get("alerts", []):
-            if alert.get("id") == alert_id:
-                alert["status"] = "resolved"
-                alert["resolved_at"] = time.time()
-                self._save_json(self.alerts_file, self.alerts)
-                return True
+        with self._alerts_lock:
+            for alert in self.alerts.get("alerts", []):
+                if alert.get("id") == alert_id:
+                    alert["status"] = "resolved"
+                    alert["resolved_at"] = time.time()
+                    self._save_json(self.alerts_file, self.alerts)
+                    return True
         return False
 
     def cleanup_suppressed(self):
         """Clean up old suppression entries."""
-        suppressed = self.alerts.get("suppressed", {})
         now = time.time()
-        self.alerts["suppressed"] = {
-            k: v for k, v in suppressed.items()
-            if now - v < 600  # Keep 10 minutes of suppression history
-        }
-        self._save_json(self.alerts_file, self.alerts)
+        with self._alerts_lock:
+            suppressed = self.alerts.get("suppressed", {})
+            self.alerts["suppressed"] = {
+                k: v for k, v in suppressed.items()
+                if now - v < 600  # Keep 10 minutes of suppression history
+            }
+            self._save_json(self.alerts_file, self.alerts)
 
     def get_stats(self) -> Dict:
         """Get storage statistics."""
@@ -403,6 +428,6 @@ class TimeSeriesStorage:
             "metric_count": len(self.get_metrics()),
             "source_count": len(self.get_sources()),
             "rule_count": len(self.get_rules()),
-            "alert_count": len(self.alerts.get("alerts", [])),
+            "alert_count": self.get_alert_counts()["active"],
             "cache_size": sum(len(v) for v in self._cache.values())
         }
